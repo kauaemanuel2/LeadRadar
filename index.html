@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lead Radar — Encontre negócios sem site</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ==================== TELA DE LOGIN / CADASTRO ==================== -->
+<div class="auth-wrap" id="authWrap">
+  <div class="auth-card">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span>Lead Radar</span>
+    </div>
+    <p class="auth-tagline">Encontre negócios sem site prontos para virar cliente.</p>
+
+    <div class="auth-msg" id="authMsg"></div>
+
+    <form id="authForm">
+      <h2 id="authTitle" style="font-family: var(--font-display); font-size:16px; margin: 0 0 16px;">Entrar</h2>
+      <div class="field">
+        <label for="authEmail">E-mail</label>
+        <input type="email" id="authEmail" required autocomplete="email" placeholder="voce@email.com">
+      </div>
+      <div class="field">
+        <label for="authPassword">Senha</label>
+        <input type="password" id="authPassword" required minlength="6" autocomplete="current-password" placeholder="••••••••">
+      </div>
+      <button type="submit" class="btn btn-primary btn-block" id="authSubmitBtn">Entrar</button>
+    </form>
+
+    <div class="auth-switch" id="authSwitchText"></div>
+  </div>
+</div>
+
+<!-- ==================== PAINEL PRINCIPAL ==================== -->
+<div class="app-shell" id="appShell">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-full">Lead Radar</span>
+    </div>
+
+    <nav class="main-nav">
+      <button class="nav-btn active" id="nav-buscar" data-view="buscar">Buscar leads</button>
+      <button class="nav-btn" id="nav-leads" data-view="leads">Meus leads</button>
+      <button class="nav-btn" id="nav-logs" data-view="logs">Histórico de buscas</button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="user-email" id="userEmail"></div>
+      <button class="link-btn" id="logoutBtn">Sair da conta</button>
+    </div>
+  </aside>
+
+  <main class="main">
+
+    <!-- ---------- VIEW: BUSCAR ---------- -->
+    <section class="view active" id="view-buscar">
+      <h1 class="page-title">Buscar leads</h1>
+      <p class="page-subtitle">Digite o tipo de negócio. O sistema procura no OpenStreetMap e mostra só quem tem WhatsApp, telefone ou e-mail cadastrado e ainda não tem site.</p>
+
+      <div class="panel">
+        <form id="searchForm" class="search-form">
+          <div class="field" style="flex:1 1 260px;">
+            <label for="termoInput">Tipo de negócio</label>
+            <input type="text" id="termoInput" list="termoSuggestions" placeholder="Ex: barbearia, pet shop, restaurante..." required>
+            <datalist id="termoSuggestions"></datalist>
+          </div>
+
+          <div class="field field-mode">
+            <label>Onde buscar</label>
+            <div class="mode-toggle">
+              <button type="button" data-mode="local" class="active">Uma região</button>
+              <button type="button" data-mode="brasil">Brasil inteiro</button>
+            </div>
+          </div>
+
+          <div class="field" id="localizacaoField" style="flex:1 1 220px;">
+            <label for="localizacaoInput">Cidade / Estado</label>
+            <input type="text" id="localizacaoInput" placeholder="Ex: Natal, RN ou Rio Grande do Norte">
+          </div>
+
+          <button type="submit" class="btn btn-primary" id="searchBtn">Buscar leads</button>
+          <button type="button" class="btn btn-ghost" id="cancelSearchBtn" style="display:none;">Cancelar</button>
+        </form>
+
+        <p class="search-hint">
+          Você pode digitar uma cidade ("Natal, RN"), só um estado ("Rio Grande do Norte" ou "RN"), ou "Brasil inteiro" percorre os 27 estados automaticamente — pode levar alguns minutos, pois respeita os limites da API pública do OpenStreetMap.
+        </p>
+
+        <div class="scan-box" id="scanBox">
+          <div class="radar"></div>
+          <div class="scan-text" style="flex:1;">
+            <strong id="scanText">Buscando...</strong>
+            <div class="progress-bar-track">
+              <div class="progress-bar-fill" id="progressFill"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="results-header">
+        <h2>Resultados</h2>
+        <div style="display:flex; align-items:center; gap:16px;">
+          <span class="results-count" id="resultsCount"></span>
+          <button class="btn btn-secondary" id="saveAllBtn" type="button">Salvar todos</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Nome</th>
+              <th>Telefone</th>
+              <th>WhatsApp</th>
+              <th>E-mail</th>
+              <th>Endereço</th>
+              <th>Site</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody">
+            <tr><td colspan="7"><div class="empty-state">Nenhum resultado ainda. Faça uma busca acima.</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------- VIEW: MEUS LEADS ---------- -->
+    <section class="view" id="view-leads">
+      <h1 class="page-title">Meus leads</h1>
+      <p class="page-subtitle">Todos os leads que você já salvou, com status de contato.</p>
+
+      <div class="filters-row">
+        <select id="leadsStatusFilter">
+          <option value="">Todos os status</option>
+          <option value="novo">Novo</option>
+          <option value="contatado">Contatado</option>
+          <option value="respondeu">Respondeu</option>
+          <option value="fechado">Fechado</option>
+          <option value="descartado">Descartado</option>
+        </select>
+        <button class="btn btn-secondary" id="refreshLeadsBtn" type="button">Atualizar</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Nome</th>
+              <th>Telefone</th>
+              <th>WhatsApp</th>
+              <th>E-mail</th>
+              <th>Endereço</th>
+              <th>Status</th>
+              <th>Salvo em</th>
+            </tr>
+          </thead>
+          <tbody id="leadsBody">
+            <tr><td colspan="7"><div class="empty-state">Carregando...</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------- VIEW: LOGS ---------- -->
+    <section class="view" id="view-logs">
+      <h1 class="page-title">Histórico de buscas</h1>
+      <p class="page-subtitle">Registro de todas as buscas realizadas, para acompanhamento.</p>
+
+      <div class="filters-row">
+        <button class="btn btn-secondary" id="refreshLogsBtn" type="button">Atualizar</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Termo buscado</th>
+              <th>Localização</th>
+              <th>Encontrados</th>
+              <th>Sem site</th>
+              <th>Data</th>
+            </tr>
+          </thead>
+          <tbody id="logsBody">
+            <tr><td colspan="5"><div class="empty-state">Carregando...</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
