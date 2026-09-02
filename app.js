@@ -1,5 +1,5 @@
 // ============================================================
-// LEAD RADAR — app.js
+// LEAD RADAR — app.js (corrigido para CORS e desempenho)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -98,7 +98,6 @@ async function handleLogout() {
   await sb.auth.signOut();
 }
 
-// Traduz erros comuns do Supabase/PostgREST para mensagens úteis
 function traduzErroSupabase(err) {
   if (!err) return 'Erro desconhecido.';
   const msg = err.message || String(err);
@@ -114,7 +113,6 @@ function traduzErroSupabase(err) {
   return msg;
 }
 
-// Garante que existe uma sessão válida antes de consultar o banco
 async function ensureSession() {
   const { data, error } = await sb.auth.getSession();
   if (error || !data.session) return null;
@@ -204,13 +202,11 @@ async function geocodeLocation(input) {
   const raw = input.trim();
 
   // 1) Usuário digitou um estado inteiro (nome ou sigla) -> usa a bbox já
-  //    conhecida do estado, sem depender de geocodificação (evita casar
-  //    com nomes de rua, ex: "Rua Rio Grande do Norte" em outra cidade).
+  //    conhecida do estado, sem depender de geocodificação
   const stateMatch = findBrazilState(raw);
   if (stateMatch) return stateMatch.bbox;
 
-  // 2) Formato "Cidade, UF" ou "Cidade, Estado" -> busca estruturada,
-  //    muito mais precisa que uma busca livre por texto.
+  // 2) Formato "Cidade, UF" ou "Cidade, Estado"
   const parts = raw.split(',').map(p => p.trim()).filter(Boolean);
   let url;
   if (parts.length === 2) {
@@ -231,16 +227,49 @@ async function geocodeLocation(input) {
   return [bb[0], bb[2], bb[1], bb[3]]; // -> [south, west, north, east]
 }
 
-// Vários espelhos públicos do Overpass — se um falhar/der 504, tenta o próximo
+// ------------------------------------------------------------
+// Proxy CORS + Overpass (GET via proxy)
+// ------------------------------------------------------------
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.openstreetmap.ru/api/interpreter',
 ];
 
-const OVERPASS_ATTEMPT_TIMEOUT_MS = 18000; // não espera mais que isso por um único servidor
+// Usamos um proxy público que aceita GET e retorna o conteúdo raw
+const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
 
-// fetch com timeout próprio por tentativa, sem depender só do timeout do navegador
+async function fetchOverpass(query, signal) {
+  let lastErr = null;
+  // Tenta cada espelho, com timeout de 15s por tentativa
+  for (const mirror of OVERPASS_MIRRORS) {
+    try {
+      // Constrói a URL completa com a query codificada
+      const fullUrl = mirror + '?data=' + encodeURIComponent(query);
+      const proxyUrl = CORS_PROXY + encodeURIComponent(fullUrl);
+
+      const res = await fetchWithTimeout(proxyUrl, {}, 15000, signal);
+      if (res.status === 504 || res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`${mirror.replace('https://', '').split('/')[0]} respondeu ${res.status}`);
+        continue;
+      }
+      if (!res.ok) throw new Error(`Overpass respondeu ${res.status}`);
+      const data = await res.json();
+      return data.elements || [];
+    } catch (err) {
+      if (signal && signal.aborted) {
+        const e = new Error('Busca cancelada');
+        e.name = 'AbortError';
+        throw e;
+      }
+      lastErr = err;
+      console.warn(`Tentativa com ${mirror} falhou:`, err.message);
+      continue;
+    }
+  }
+  throw lastErr || new Error('Todos os servidores do Overpass estão indisponíveis no momento. Tente novamente em instantes.');
+}
+
 function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
   const controller = new AbortController();
   const onOuterAbort = () => controller.abort();
@@ -256,35 +285,7 @@ function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
     });
 }
 
-async function fetchOverpass(query, signal) {
-  let lastErr = null;
-  for (const mirror of OVERPASS_MIRRORS) {
-    try {
-      const res = await fetchWithTimeout(
-        mirror,
-        { method: 'POST', body: 'data=' + encodeURIComponent(query) },
-        OVERPASS_ATTEMPT_TIMEOUT_MS,
-        signal
-      );
-      if (res.status === 504 || res.status === 429 || res.status >= 500) {
-        lastErr = new Error(`${mirror.replace('https://', '').split('/')[0]} respondeu ${res.status}`);
-        continue; // tenta o próximo espelho
-      }
-      if (!res.ok) throw new Error(`Overpass respondeu ${res.status}`);
-      const data = await res.json();
-      return data.elements || [];
-    } catch (err) {
-      if (signal && signal.aborted) { const e = new Error('Busca cancelada'); e.name = 'AbortError'; throw e; }
-      lastErr = err.name === 'AbortError'
-        ? new Error(`${mirror.replace('https://', '').split('/')[0]} não respondeu a tempo`)
-        : err;
-      continue; // este era só o timeout da tentativa; tenta o próximo espelho
-    }
-  }
-  throw lastErr || new Error('Todos os servidores do Overpass estão indisponíveis no momento. Tente novamente em instantes.');
-}
-
-// Busca combinando tag + nome, dentro de UM bloco (bbox pequeno)
+// Busca combinando tag + nome, dentro de UM bloco (bbox)
 async function searchElementsInTile(termo, bbox, signal) {
   const tagClauses = getTagsForTermo(termo);
   const seen = new Map();
@@ -294,8 +295,7 @@ async function searchElementsInTile(termo, bbox, signal) {
     tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
   }
 
-  // Só roda a busca por nome (mais pesada) se não houver mapeamento de tag
-  // OU se a busca por tag trouxe poucos resultados.
+  // Só roda a busca por nome se não houver tag ou se poucos resultados
   if (!tagClauses || seen.size < 5) {
     await new Promise(r => setTimeout(r, 300));
     try {
@@ -310,9 +310,8 @@ async function searchElementsInTile(termo, bbox, signal) {
   return Array.from(seen.values());
 }
 
-// Divide uma região grande em blocos menores, para não sobrecarregar o
-// Overpass (regiões grandes/estados costumam dar timeout numa consulta só).
-function splitBboxIntoTiles(bbox, maxSpanDeg = 1.2, maxTiles = 48) {
+// Divide uma região grande em blocos menores (com span maior para reduzir número)
+function splitBboxIntoTiles(bbox, maxSpanDeg = 2.0, maxTiles = 30) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
@@ -334,19 +333,22 @@ function splitBboxIntoTiles(bbox, maxSpanDeg = 1.2, maxTiles = 48) {
       }
       return tiles;
     }
-    span *= 1.6; // ainda tem tiles demais, aumenta o tamanho do bloco e recalcula
+    span *= 1.5;
   }
-  return [bbox]; // fallback: se nada coube, tenta a região inteira mesmo assim
+  return [bbox]; // fallback
 }
 
-// Busca em toda a região, dividindo em blocos automaticamente quando necessário.
-// onTileProgress(concluidos, total) é chamado a cada bloco processado.
+// Busca em toda a região, dividindo em blocos
 async function searchElements(termo, bbox, signal, onTileProgress) {
   const tiles = splitBboxIntoTiles(bbox);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
-    if (signal && signal.aborted) { const e = new Error('Busca cancelada'); e.name = 'AbortError'; throw e; }
+    if (signal && signal.aborted) {
+      const e = new Error('Busca cancelada');
+      e.name = 'AbortError';
+      throw e;
+    }
     try {
       const elements = await searchElementsInTile(termo, tiles[i], signal);
       elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
@@ -355,6 +357,7 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
       console.warn(`Falha no bloco ${i + 1}/${tiles.length}, seguindo para o próximo:`, err.message);
     }
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
+    // Pausa curta entre blocos
     if (tiles.length > 1) await new Promise(r => setTimeout(r, 500));
   }
 
@@ -451,7 +454,7 @@ async function performSearch(e) {
       await logSearch(termo, localizacao, 'local', totalBrutos, currentResults.length, 0);
       setProgress(100);
     } else {
-      // Modo Brasil inteiro: percorre estado por estado
+      // Modo Brasil inteiro
       for (let i = 0; i < BRAZIL_STATES.length; i++) {
         if (searchAbort.signal.aborted) break;
         const st = BRAZIL_STATES[i];
@@ -476,7 +479,7 @@ async function performSearch(e) {
         } catch (stErr) {
           console.warn(`Falha ao buscar em ${st.nome}:`, stErr.message);
         }
-        // pequena pausa para não sobrecarregar a API pública do Overpass
+        // Pausa entre estados
         await new Promise(r => setTimeout(r, 1200));
       }
       await logSearch(termo, 'Brasil inteiro', 'brasil', totalBrutos, currentResults.length, 0);
@@ -734,6 +737,4 @@ document.addEventListener('DOMContentLoaded', () => {
       $('#localizacaoField').style.display = searchMode === 'local' ? 'block' : 'none';
     });
   });
-  // Não precisa checar a sessão manualmente aqui: o listener
-  // onAuthStateChange já dispara com a sessão atual assim que a página carrega.
 });
