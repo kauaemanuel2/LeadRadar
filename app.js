@@ -1,5 +1,5 @@
 // ============================================================
-// LEAD RADAR — app.js (corrigido com proxies robustos)
+// LEAD RADAR — app.js (última versão com proxies atualizados)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -218,7 +218,7 @@ async function geocodeLocation(input) {
 }
 
 // ------------------------------------------------------------
-// Proxy CORS com lista robusta e timeout
+// Proxies atualizados (prioridade: cors-anywhere, allorigins, corsproxy)
 // ------------------------------------------------------------
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
@@ -227,25 +227,27 @@ const OVERPASS_MIRRORS = [
   'https://overpass-turbo.eu/api/interpreter',
 ];
 
-// Ordem de prioridade dos proxies (os mais estáveis primeiro)
 const CORS_PROXIES = [
-  'https://thingproxy.freeboard.io/fetch/',
+  'https://cors-anywhere.herokuapp.com/', // mais estável atualmente
   'https://api.allorigins.win/raw?url=',
   'https://corsproxy.io/?',
 ];
 
-const REQUEST_TIMEOUT_MS = 60000; // 60 segundos
+const REQUEST_TIMEOUT_MS = 90000; // 90 segundos
 
 async function fetchOverpass(query, signal) {
   let lastErr = null;
 
-  // Tenta todos os proxies e mirrors
   for (const proxy of CORS_PROXIES) {
     for (const mirror of OVERPASS_MIRRORS) {
       try {
         const fullUrl = mirror + '?data=' + encodeURIComponent(query);
         const proxyUrl = proxy + encodeURIComponent(fullUrl);
-        const res = await fetchWithTimeout(proxyUrl, {}, REQUEST_TIMEOUT_MS, signal);
+        const res = await fetchWithTimeout(proxyUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        }, REQUEST_TIMEOUT_MS, signal);
         if (res.status === 504 || res.status === 429 || res.status >= 500) {
           lastErr = new Error(`Proxy ${proxy} + ${mirror} respondeu ${res.status}`);
           continue;
@@ -261,13 +263,12 @@ async function fetchOverpass(query, signal) {
         }
         lastErr = err;
         console.warn(`Falha com ${mirror} via ${proxy}:`, err.message);
-        // Pequena pausa antes de tentar o próximo
-        await new Promise(r => setTimeout(r, 800));
+        await new Promise(r => setTimeout(r, 1000));
       }
     }
   }
 
-  // Último recurso: tentar diretamente (sem proxy) - pode funcionar em alguns navegadores
+  // Último recurso: tentar diretamente (sem proxy)
   try {
     for (const mirror of OVERPASS_MIRRORS) {
       const fullUrl = mirror + '?data=' + encodeURIComponent(query);
@@ -311,7 +312,6 @@ async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
       const tagResults = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
       tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
       if (seen.size < 100) {
-        // Busca por nome complementar
         try {
           const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
           nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
@@ -360,7 +360,7 @@ function splitBboxRecursively(bbox, maxSpan, minSpan = 0.05) {
 
 async function searchElements(termo, bbox, signal, onTileProgress) {
   const hasTags = !!getTagsForTermo(termo);
-  const initialSpan = hasTags ? 0.3 : 0.15; // blocos bem pequenos
+  const initialSpan = hasTags ? 0.3 : 0.15;
   let tiles = splitBboxRecursively(bbox, initialSpan, 0.05);
   const seen = new Map();
 
@@ -383,7 +383,6 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
         if (err.name === 'AbortError') throw err;
         console.warn(`Bloco ${i+1} falhou (tentativa ${attempt+1}):`, err.message);
         if (attempt === 0) {
-          // Subdivide ainda mais
           const subTiles = splitBboxRecursively(tiles[i], 0.1, 0.025);
           tiles.splice(i + 1, 0, ...subTiles);
           tiles[i] = subTiles[0];
@@ -404,9 +403,6 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
   return Array.from(seen.values());
 }
 
-// ------------------------------------------------------------
-// Parse e UI (mantidos iguais)
-// ------------------------------------------------------------
 function parseElement(el, termo) {
   const tags = el.tags || {};
   const nome = tags.name;
@@ -453,9 +449,6 @@ function setProgress(pct) {
   $('#progressFill').style.width = `${pct}%`;
 }
 
-// ------------------------------------------------------------
-// Perform Search
-// ------------------------------------------------------------
 async function performSearch(e) {
   e.preventDefault();
   const termo = $('#termoInput').value.trim();
@@ -551,9 +544,6 @@ function cancelSearch() {
   if (searchAbort) searchAbort.abort();
 }
 
-// ------------------------------------------------------------
-// Log de busca
-// ------------------------------------------------------------
 async function logSearch(termo, localizacao, modo, totalEncontrados, totalSemSite, totalSalvos) {
   if (!currentUser) return;
   try {
@@ -572,9 +562,6 @@ async function logSearch(termo, localizacao, modo, totalEncontrados, totalSemSit
   }
 }
 
-// ------------------------------------------------------------
-// Renderização e salvamento (mantidos)
-// ------------------------------------------------------------
 function renderResults(results) {
   const tbody = $('#resultsBody');
   const countEl = $('#resultsCount');
@@ -649,9 +636,6 @@ async function saveAllLeads() {
   }
 }
 
-// ------------------------------------------------------------
-// Meus Leads e Logs (mantidos)
-// ------------------------------------------------------------
 async function loadMeusLeads() {
   if (!currentUser) return;
   const tbody = $('#leadsBody');
@@ -747,9 +731,6 @@ async function loadLogs() {
   `).join('');
 }
 
-// ------------------------------------------------------------
-// Inicialização
-// ------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   const datalist = $('#termoSuggestions');
   datalist.innerHTML = Object.keys(TAG_MAP).map(k => `<option value="${escapeHtml(k)}">`).join('');
