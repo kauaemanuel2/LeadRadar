@@ -1,5 +1,5 @@
 // ============================================================
-// LEAD RADAR — app.js (última versão com proxies atualizados)
+// LEAD RADAR — app.js (com blocos otimizados e API própria)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -149,7 +149,7 @@ function switchView(name) {
 }
 
 // ------------------------------------------------------------
-// Busca — OpenStreetMap
+// Busca — OpenStreetMap (apenas tags, sem busca por nome)
 // ------------------------------------------------------------
 function buildWhatsappLink(raw) {
   if (!raw) return null;
@@ -172,14 +172,7 @@ function buildTagQuery(tagClauses, bbox, limit = 200) {
     const [k, v] = tc.split('=');
     return `nwr["${k}"="${v}"](${bboxStr});`;
   });
-  return `[out:json][timeout:45];(${clauses.join('')});out ${limit} center tags;`;
-}
-
-function buildNameQuery(termo, bbox, limit = 200) {
-  const [s, w, n, e] = bbox;
-  const bboxStr = `${s},${w},${n},${e}`;
-  const safeTerm = termo.trim().replace(/["\\]/g, '');
-  return `[out:json][timeout:45];(nwr["name"~"${safeTerm}",i](${bboxStr}););out ${limit} center tags;`;
+  return `[out:json][timeout:30];(${clauses.join('')});out ${limit} center tags;`;
 }
 
 function normalizeText(s) {
@@ -218,130 +211,47 @@ async function geocodeLocation(input) {
 }
 
 // ------------------------------------------------------------
-// Proxies atualizados (prioridade: cors-anywhere, allorigins, corsproxy)
+// Chamada à API própria (Vercel)
 // ------------------------------------------------------------
-const OVERPASS_MIRRORS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.openstreetmap.ru/api/interpreter',
-  'https://overpass-turbo.eu/api/interpreter',
-];
-
-const CORS_PROXIES = [
-  'https://cors-anywhere.herokuapp.com/', // mais estável atualmente
-  'https://api.allorigins.win/raw?url=',
-  'https://corsproxy.io/?',
-];
-
-const REQUEST_TIMEOUT_MS = 90000; // 90 segundos
-
 async function fetchOverpass(query, signal) {
-  let lastErr = null;
-
-  for (const proxy of CORS_PROXIES) {
-    for (const mirror of OVERPASS_MIRRORS) {
-      try {
-        const fullUrl = mirror + '?data=' + encodeURIComponent(query);
-        const proxyUrl = proxy + encodeURIComponent(fullUrl);
-        const res = await fetchWithTimeout(proxyUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-          }
-        }, REQUEST_TIMEOUT_MS, signal);
-        if (res.status === 504 || res.status === 429 || res.status >= 500) {
-          lastErr = new Error(`Proxy ${proxy} + ${mirror} respondeu ${res.status}`);
-          continue;
-        }
-        if (!res.ok) throw new Error(`Erro ${res.status} de ${mirror} via ${proxy}`);
-        const data = await res.json();
-        return data.elements || [];
-      } catch (err) {
-        if (signal && signal.aborted) {
-          const e = new Error('Busca cancelada');
-          e.name = 'AbortError';
-          throw e;
-        }
-        lastErr = err;
-        console.warn(`Falha com ${mirror} via ${proxy}:`, err.message);
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-  }
-
-  // Último recurso: tentar diretamente (sem proxy)
   try {
-    for (const mirror of OVERPASS_MIRRORS) {
-      const fullUrl = mirror + '?data=' + encodeURIComponent(query);
-      const res = await fetchWithTimeout(fullUrl, {}, REQUEST_TIMEOUT_MS, signal);
-      if (res.ok) {
-        const data = await res.json();
-        return data.elements || [];
-      }
-    }
-  } catch (err) {
-    lastErr = err;
-  }
-
-  throw lastErr || new Error('Todos os proxies e servidores falharam. Tente novamente mais tarde.');
-}
-
-function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
-  const controller = new AbortController();
-  const onOuterAbort = () => controller.abort();
-  if (outerSignal) {
-    if (outerSignal.aborted) controller.abort();
-    outerSignal.addEventListener('abort', onOuterAbort);
-  }
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => {
-      clearTimeout(timer);
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
+    const response = await fetch('/api/overpass', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+      signal,
     });
-}
-
-// ------------------------------------------------------------
-// Busca com subdivisão adaptativa (blocos bem pequenos)
-// ------------------------------------------------------------
-async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
-  const tagClauses = getTagsForTermo(termo);
-  const seen = new Map();
-
-  if (tagClauses && !tryNameOnly) {
-    try {
-      const tagResults = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
-      tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-      if (seen.size < 100) {
-        try {
-          const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
-          nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-        } catch (nameErr) { /* ignora */ }
-      }
-    } catch (err) {
-      if (err.name === 'AbortError') throw err;
-      console.warn('Busca por tag falhou, tentando nome:', err.message);
-      try {
-        const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
-        nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-      } catch (nameErr) {
-        if (nameErr.name === 'AbortError') throw nameErr;
-        console.warn('Busca por nome também falhou:', nameErr.message);
-      }
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.error || `Erro ${response.status}`);
     }
-  } else {
-    try {
-      const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
-      nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-    } catch (err) {
-      if (err.name === 'AbortError') throw err;
-      console.warn('Busca por nome falhou:', err.message);
-    }
+    const data = await response.json();
+    return data.elements || [];
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    console.error('Erro na API Overpass:', err);
+    throw new Error('Falha ao consultar o Overpass via API. Tente novamente.');
   }
-
-  return Array.from(seen.values());
 }
 
-function splitBboxRecursively(bbox, maxSpan, minSpan = 0.05) {
+// ------------------------------------------------------------
+// Busca com subdivisão adaptativa (blocos muito pequenos)
+// ------------------------------------------------------------
+async function searchElementsInTile(termo, bbox, signal) {
+  const tagClauses = getTagsForTermo(termo);
+  if (!tagClauses) return []; // sem tags, não busca
+
+  try {
+    const results = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
+    return results;
+  } catch (err) {
+    if (err.name === 'AbortError') throw err;
+    console.warn('Busca por tag falhou:', err.message);
+    return [];
+  }
+}
+
+function splitBboxRecursively(bbox, maxSpan, minSpan = 0.02) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
@@ -359,9 +269,9 @@ function splitBboxRecursively(bbox, maxSpan, minSpan = 0.05) {
 }
 
 async function searchElements(termo, bbox, signal, onTileProgress) {
-  const hasTags = !!getTagsForTermo(termo);
-  const initialSpan = hasTags ? 0.3 : 0.15;
-  let tiles = splitBboxRecursively(bbox, initialSpan, 0.05);
+  // Blocos muito pequenos (0.15° com tags, 0.08° sem tags - mas sem tags não busca)
+  const initialSpan = 0.15;
+  let tiles = splitBboxRecursively(bbox, initialSpan, 0.02);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
@@ -383,7 +293,7 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
         if (err.name === 'AbortError') throw err;
         console.warn(`Bloco ${i+1} falhou (tentativa ${attempt+1}):`, err.message);
         if (attempt === 0) {
-          const subTiles = splitBboxRecursively(tiles[i], 0.1, 0.025);
+          const subTiles = splitBboxRecursively(tiles[i], 0.05, 0.01);
           tiles.splice(i + 1, 0, ...subTiles);
           tiles[i] = subTiles[0];
         } else {
@@ -397,7 +307,7 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
     }
 
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 200));
   }
 
   return Array.from(seen.values());
@@ -449,10 +359,19 @@ function setProgress(pct) {
   $('#progressFill').style.width = `${pct}%`;
 }
 
+// ------------------------------------------------------------
+// Perform Search
+// ------------------------------------------------------------
 async function performSearch(e) {
   e.preventDefault();
   const termo = $('#termoInput').value.trim();
   if (!termo) { toast('Digite o tipo de negócio.', 'error'); return; }
+
+  // Verifica se o termo tem mapeamento de tags
+  if (!getTagsForTermo(termo)) {
+    toast('Nenhum mapeamento de tags para este termo. Adicione em TAG_MAP.', 'error');
+    return;
+  }
 
   currentResults = [];
   savedOsmIds = new Set();
@@ -517,7 +436,7 @@ async function performSearch(e) {
         } catch (stErr) {
           console.warn(`Falha ao buscar em ${st.nome}:`, stErr.message);
         }
-        await new Promise(r => setTimeout(r, 1200));
+        await new Promise(r => setTimeout(r, 1000));
       }
       await logSearch(termo, 'Brasil inteiro', 'brasil', totalBrutos, currentResults.length, 0);
     }
@@ -562,6 +481,9 @@ async function logSearch(termo, localizacao, modo, totalEncontrados, totalSemSit
   }
 }
 
+// ------------------------------------------------------------
+// Renderização e salvamento (mantidos)
+// ------------------------------------------------------------
 function renderResults(results) {
   const tbody = $('#resultsBody');
   const countEl = $('#resultsCount');
@@ -731,6 +653,9 @@ async function loadLogs() {
   `).join('');
 }
 
+// ------------------------------------------------------------
+// Inicialização
+// ------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   const datalist = $('#termoSuggestions');
   datalist.innerHTML = Object.keys(TAG_MAP).map(k => `<option value="${escapeHtml(k)}">`).join('');
