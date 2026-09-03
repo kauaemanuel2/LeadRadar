@@ -1,5 +1,5 @@
 // ============================================================
-// LEAD RADAR — app.js (corrigido: adaptação dinâmica de blocos)
+// LEAD RADAR — app.js (corrigido: proxies, blocos, timeout)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -35,7 +35,7 @@ function escapeHtml(str) {
 }
 
 // ------------------------------------------------------------
-// Autenticação
+// Autenticação (mantida igual)
 // ------------------------------------------------------------
 function showAuthMsg(text, type) {
   const box = $('#authMsg');
@@ -165,21 +165,21 @@ function getTagsForTermo(termo) {
   return TAG_MAP[key] || null;
 }
 
-function buildTagQuery(tagClauses, bbox) {
+function buildTagQuery(tagClauses, bbox, limit = 500) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const clauses = tagClauses.map(tc => {
     const [k, v] = tc.split('=');
     return `nwr["${k}"="${v}"](${bboxStr});`;
   });
-  return `[out:json][timeout:45];(${clauses.join('')});out center tags;`;
+  return `[out:json][timeout:60];(${clauses.join('')});out ${limit} center tags;`;
 }
 
-function buildNameQuery(termo, bbox) {
+function buildNameQuery(termo, bbox, limit = 500) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const safeTerm = termo.trim().replace(/["\\]/g, '');
-  return `[out:json][timeout:45];(nwr["name"~"${safeTerm}",i](${bboxStr}););out center tags;`;
+  return `[out:json][timeout:60];(nwr["name"~"${safeTerm}",i](${bboxStr}););out ${limit} center tags;`;
 }
 
 function normalizeText(s) {
@@ -218,7 +218,7 @@ async function geocodeLocation(input) {
 }
 
 // ------------------------------------------------------------
-// Proxy CORS + Overpass — com retry e backoff
+// Proxy CORS com lista ampliada e timeout alto
 // ------------------------------------------------------------
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
@@ -226,16 +226,19 @@ const OVERPASS_MIRRORS = [
   'https://overpass.openstreetmap.ru/api/interpreter',
 ];
 
+// Proxies públicos (mais opções)
 const CORS_PROXIES = [
   'https://api.allorigins.win/raw?url=',
   'https://corsproxy.io/?',
+  'https://cors-anywhere.herokuapp.com/',
+  'https://thingproxy.freeboard.io/fetch/',
 ];
 
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 60000; // 60 segundos
 
-async function fetchOverpass(query, signal, retries = 2) {
+async function fetchOverpass(query, signal, retries = 3) {
   let lastErr = null;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     for (const proxy of CORS_PROXIES) {
       for (const mirror of OVERPASS_MIRRORS) {
         try {
@@ -256,9 +259,9 @@ async function fetchOverpass(query, signal, retries = 2) {
             throw e;
           }
           lastErr = err;
-          console.warn(`Tentativa ${attempt + 1} com ${mirror} via ${proxy} falhou:`, err.message);
-          // Aguarda antes de tentar o próximo proxy/espelho (backoff)
-          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          console.warn(`Tentativa ${attempt} com ${mirror} via ${proxy} falhou:`, err.message);
+          // Aguarda antes de tentar o próximo (backoff)
+          await new Promise(r => setTimeout(r, 2000 * attempt));
         }
       }
     }
@@ -295,20 +298,30 @@ function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
 }
 
 // ------------------------------------------------------------
-// Busca com adaptação dinâmica de blocos
+// Busca com subdivisão recursiva e tamanho adaptativo
 // ------------------------------------------------------------
 async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
   const tagClauses = getTagsForTermo(termo);
   const seen = new Map();
 
+  // Tenta primeiro a estratégia principal (tag ou nome)
   if (tagClauses && !tryNameOnly) {
     try {
       const tagResults = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
       tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
+      // Se a busca por tag retornou muitos resultados, talvez seja melhor não buscar nome
+      if (seen.size < 200) {
+        // Busca por nome complementar
+        try {
+          const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
+          nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
+        } catch (nameErr) {
+          // Ignora erro na busca por nome
+        }
+      }
     } catch (err) {
       if (err.name === 'AbortError') throw err;
       console.warn('Busca por tag falhou, tentando apenas nome:', err.message);
-      // Se a busca por tag falhou, tentamos apenas por nome
       try {
         const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
         nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
@@ -331,40 +344,31 @@ async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
   return Array.from(seen.values());
 }
 
-// Divide a região em blocos, com tamanho adaptativo
-function splitBboxIntoTiles(bbox, maxSpanDeg) {
+// Divide o bloco recursivamente até um tamanho mínimo (0.1 grau)
+function splitBboxRecursively(bbox, maxSpan, minSpan = 0.1) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
-  if (latSpan <= maxSpanDeg && lonSpan <= maxSpanDeg) return [bbox];
+  if (latSpan <= maxSpan && lonSpan <= maxSpan) return [bbox];
+  if (latSpan <= minSpan && lonSpan <= minSpan) return [bbox]; // não subdivide mais
 
-  let span = maxSpanDeg;
-  let tiles = [];
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const rows = Math.max(1, Math.ceil(latSpan / span));
-    const cols = Math.max(1, Math.ceil(lonSpan / span));
-    if (rows * cols <= 30) {
-      const dLat = latSpan / rows;
-      const dLon = lonSpan / cols;
-      tiles = [];
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          tiles.push([s + r * dLat, w + c * dLon, s + (r + 1) * dLat, w + (c + 1) * dLon]);
-        }
-      }
-      return tiles;
-    }
-    span *= 1.5;
-  }
-  return [bbox];
+  // Subdivide em 4
+  const midLat = (s + n) / 2;
+  const midLon = (w + e) / 2;
+  return [
+    [s, w, midLat, midLon],
+    [s, midLon, midLat, e],
+    [midLat, w, n, midLon],
+    [midLat, midLon, n, e]
+  ].flatMap(sub => splitBboxRecursively(sub, maxSpan, minSpan));
 }
 
-// Busca principal com adaptação: se um bloco falha, subdivide-o em 4 menores e tenta novamente
+// Busca principal com subdivisão adaptativa
 async function searchElements(termo, bbox, signal, onTileProgress) {
   const hasTags = !!getTagsForTermo(termo);
-  // Blocos menores para termos sem tags (busca textual)
-  const initialSpan = hasTags ? 1.0 : 0.6;
-  let tiles = splitBboxIntoTiles(bbox, initialSpan);
+  // Tamanho do bloco: menor para nichos sem tags (busca textual pesada)
+  const initialSpan = hasTags ? 0.6 : 0.3;
+  let tiles = splitBboxRecursively(bbox, initialSpan, 0.1);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
@@ -375,37 +379,26 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
     }
 
     let elements = [];
-    let currentTile = tiles[i];
     let success = false;
 
-    // Tenta o bloco atual, se falhar, subdivide em 4
-    for (let subAttempt = 0; subAttempt < 2; subAttempt++) {
+    // Tenta o bloco atual, com fallback para subdivisão se falhar
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        elements = await searchElementsInTile(termo, currentTile, signal);
+        elements = await searchElementsInTile(termo, tiles[i], signal);
         success = true;
         break;
       } catch (err) {
         if (err.name === 'AbortError') throw err;
-        console.warn(`Falha no bloco (${subAttempt + 1}):`, err.message);
-        if (subAttempt === 0) {
-          // Subdivide o bloco em 4 menores
-          const [s, w, n, e] = currentTile;
-          const midLat = (s + n) / 2;
-          const midLon = (w + e) / 2;
-          const subTiles = [
-            [s, w, midLat, midLon],
-            [s, midLon, midLat, e],
-            [midLat, w, n, midLon],
-            [midLat, midLon, n, e]
-          ];
-          // Substitui os próximos blocos pelos sub-blocos
+        console.warn(`Falha no bloco ${i+1} (tentativa ${attempt+1}):`, err.message);
+        if (attempt === 0) {
+          // Subdivide o bloco em 4 menores (recursivamente) e os insere na fila
+          const subTiles = splitBboxRecursively(tiles[i], 0.2, 0.05);
           tiles.splice(i + 1, 0, ...subTiles);
-          // Pega o primeiro sub-bloco para tentar agora
-          currentTile = subTiles[0];
+          // Processa o primeiro sub-bloco agora
+          tiles[i] = subTiles[0];
           // Os outros serão processados na sequência
-          // (não incrementa i para processar este sub-bloco)
         } else {
-          // Se a subdivisão também falhar, pula para o próximo bloco
+          // Falhou também na subdivisão, pula
           success = false;
         }
       }
@@ -425,7 +418,7 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
 }
 
 // ------------------------------------------------------------
-// Parse e UI
+// Parse e UI (mantidos iguais)
 // ------------------------------------------------------------
 function parseElement(el, termo) {
   const tags = el.tags || {};
@@ -473,6 +466,9 @@ function setProgress(pct) {
   $('#progressFill').style.width = `${pct}%`;
 }
 
+// ------------------------------------------------------------
+// Perform Search (mantido)
+// ------------------------------------------------------------
 async function performSearch(e) {
   e.preventDefault();
   const termo = $('#termoInput').value.trim();
@@ -587,7 +583,7 @@ async function logSearch(termo, localizacao, modo, totalEncontrados, totalSemSit
 }
 
 // ------------------------------------------------------------
-// Renderização dos resultados
+// Renderização e salvamento (mantidos)
 // ------------------------------------------------------------
 function renderResults(results) {
   const tbody = $('#resultsBody');
@@ -625,9 +621,6 @@ function renderResults(results) {
   });
 }
 
-// ------------------------------------------------------------
-// Salvar leads
-// ------------------------------------------------------------
 async function saveSingleLead(idx) {
   const lead = currentResults[idx];
   if (!lead || !currentUser) return;
@@ -667,7 +660,7 @@ async function saveAllLeads() {
 }
 
 // ------------------------------------------------------------
-// Meus Leads
+// Meus Leads e Logs (mantidos)
 // ------------------------------------------------------------
 async function loadMeusLeads() {
   if (!currentUser) return;
@@ -727,9 +720,6 @@ async function updateLeadStatus(id, status) {
   }
 }
 
-// ------------------------------------------------------------
-// Logs
-// ------------------------------------------------------------
 async function loadLogs() {
   if (!currentUser) return;
   const tbody = $('#logsBody');
