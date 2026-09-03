@@ -1,14 +1,14 @@
 // ============================================================
-// LEAD RADAR — app.js (com API própria Vercel)
+// LEAD RADAR — app.js (corrigido com proxies robustos)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let currentUser = null;
-let currentResults = [];   // resultados da última busca (não salvos ainda)
-let savedOsmIds = new Set(); // ids já salvos nesta sessão (feedback visual)
+let currentResults = [];
+let savedOsmIds = new Set();
 let searchAbort = null;
-let searchMode = 'local';  // 'local' | 'brasil'
+let searchMode = 'local';
 
 // ------------------------------------------------------------
 // Helpers de UI
@@ -47,7 +47,7 @@ function clearAuthMsg() {
   box.className = 'auth-msg';
 }
 
-let authMode = 'login'; // 'login' | 'signup'
+let authMode = 'login';
 
 function setAuthMode(mode) {
   authMode = mode;
@@ -139,9 +139,6 @@ function renderAuthState() {
   }
 }
 
-// ------------------------------------------------------------
-// Navegação entre views
-// ------------------------------------------------------------
 function switchView(name) {
   $all('.view').forEach(v => v.classList.remove('active'));
   $all('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -152,7 +149,7 @@ function switchView(name) {
 }
 
 // ------------------------------------------------------------
-// Busca — OpenStreetMap (Nominatim + Overpass)
+// Busca — OpenStreetMap
 // ------------------------------------------------------------
 function buildWhatsappLink(raw) {
   if (!raw) return null;
@@ -168,23 +165,21 @@ function getTagsForTermo(termo) {
   return TAG_MAP[key] || null;
 }
 
-// Consulta só por TAG (rápida, usa índice do Overpass)
-function buildTagQuery(tagClauses, bbox, limit = 500) {
+function buildTagQuery(tagClauses, bbox, limit = 200) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const clauses = tagClauses.map(tc => {
     const [k, v] = tc.split('=');
     return `nwr["${k}"="${v}"](${bboxStr});`;
   });
-  return `[out:json][timeout:60];(${clauses.join('')});out ${limit} center tags;`;
+  return `[out:json][timeout:45];(${clauses.join('')});out ${limit} center tags;`;
 }
 
-// Consulta por NOME (regex) — mais pesada
-function buildNameQuery(termo, bbox, limit = 500) {
+function buildNameQuery(termo, bbox, limit = 200) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const safeTerm = termo.trim().replace(/["\\]/g, '');
-  return `[out:json][timeout:60];(nwr["name"~"${safeTerm}",i](${bboxStr}););out ${limit} center tags;`;
+  return `[out:json][timeout:45];(nwr["name"~"${safeTerm}",i](${bboxStr}););out ${limit} center tags;`;
 }
 
 function normalizeText(s) {
@@ -200,12 +195,9 @@ const UF_TO_NOME = Object.fromEntries(BRAZIL_STATES.map(st => [st.uf, st.nome]))
 
 async function geocodeLocation(input) {
   const raw = input.trim();
-
-  // 1) Usuário digitou um estado inteiro (nome ou sigla) -> usa a bbox já conhecida
   const stateMatch = findBrazilState(raw);
   if (stateMatch) return stateMatch.bbox;
 
-  // 2) Formato "Cidade, UF" ou "Cidade, Estado"
   const parts = raw.split(',').map(p => p.trim()).filter(Boolean);
   let url;
   if (parts.length === 2) {
@@ -214,7 +206,6 @@ async function geocodeLocation(input) {
     const estadoNome = st ? st.nome : (UF_TO_NOME[ufOuEstado.toUpperCase()] || ufOuEstado);
     url = `https://nominatim.openstreetmap.org/search?format=json&city=${encodeURIComponent(cidade)}&state=${encodeURIComponent(estadoNome)}&country=Brazil&limit=1`;
   } else {
-    // 3) Texto livre -> busca simples, restrita ao Brasil
     url = `https://nominatim.openstreetmap.org/search?format=json&countrycodes=br&q=${encodeURIComponent(raw + ', Brasil')}&limit=1`;
   }
 
@@ -222,62 +213,113 @@ async function geocodeLocation(input) {
   if (!res.ok) throw new Error('Falha ao localizar essa região.');
   const data = await res.json();
   if (!data.length) throw new Error('Não encontrei essa cidade/região. Tente escrever "Cidade, UF" ou o nome de um estado.');
-  const bb = data[0].boundingbox.map(Number); // [minLat, maxLat, minLon, maxLon]
-  return [bb[0], bb[2], bb[1], bb[3]]; // -> [south, west, north, east]
+  const bb = data[0].boundingbox.map(Number);
+  return [bb[0], bb[2], bb[1], bb[3]];
 }
 
 // ------------------------------------------------------------
-// Chamada à API interna (Vercel) em vez de proxies
+// Proxy CORS com lista robusta e timeout
 // ------------------------------------------------------------
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.openstreetmap.ru/api/interpreter',
+  'https://overpass-turbo.eu/api/interpreter',
+];
+
+// Ordem de prioridade dos proxies (os mais estáveis primeiro)
+const CORS_PROXIES = [
+  'https://thingproxy.freeboard.io/fetch/',
+  'https://api.allorigins.win/raw?url=',
+  'https://corsproxy.io/?',
+];
+
+const REQUEST_TIMEOUT_MS = 60000; // 60 segundos
+
 async function fetchOverpass(query, signal) {
-  try {
-    const response = await fetch('/api/overpass', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
-      signal, // suporta cancelamento via AbortController
-    });
+  let lastErr = null;
 
-    if (!response.ok) {
-      const errData = await response.json().catch(() => ({}));
-      throw new Error(errData.error || `Erro ${response.status} na API`);
+  // Tenta todos os proxies e mirrors
+  for (const proxy of CORS_PROXIES) {
+    for (const mirror of OVERPASS_MIRRORS) {
+      try {
+        const fullUrl = mirror + '?data=' + encodeURIComponent(query);
+        const proxyUrl = proxy + encodeURIComponent(fullUrl);
+        const res = await fetchWithTimeout(proxyUrl, {}, REQUEST_TIMEOUT_MS, signal);
+        if (res.status === 504 || res.status === 429 || res.status >= 500) {
+          lastErr = new Error(`Proxy ${proxy} + ${mirror} respondeu ${res.status}`);
+          continue;
+        }
+        if (!res.ok) throw new Error(`Erro ${res.status} de ${mirror} via ${proxy}`);
+        const data = await res.json();
+        return data.elements || [];
+      } catch (err) {
+        if (signal && signal.aborted) {
+          const e = new Error('Busca cancelada');
+          e.name = 'AbortError';
+          throw e;
+        }
+        lastErr = err;
+        console.warn(`Falha com ${mirror} via ${proxy}:`, err.message);
+        // Pequena pausa antes de tentar o próximo
+        await new Promise(r => setTimeout(r, 800));
+      }
     }
-
-    const data = await response.json();
-    return data.elements || [];
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      // Re-lança para ser tratado como cancelamento
-      throw err;
-    }
-    console.error('Erro na API Overpass:', err);
-    throw new Error('Falha ao consultar o Overpass via API. Tente novamente.');
   }
+
+  // Último recurso: tentar diretamente (sem proxy) - pode funcionar em alguns navegadores
+  try {
+    for (const mirror of OVERPASS_MIRRORS) {
+      const fullUrl = mirror + '?data=' + encodeURIComponent(query);
+      const res = await fetchWithTimeout(fullUrl, {}, REQUEST_TIMEOUT_MS, signal);
+      if (res.ok) {
+        const data = await res.json();
+        return data.elements || [];
+      }
+    }
+  } catch (err) {
+    lastErr = err;
+  }
+
+  throw lastErr || new Error('Todos os proxies e servidores falharam. Tente novamente mais tarde.');
 }
 
-// Busca combinando tag + nome, dentro de UM bloco
+function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
+  const controller = new AbortController();
+  const onOuterAbort = () => controller.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort();
+    outerSignal.addEventListener('abort', onOuterAbort);
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => {
+      clearTimeout(timer);
+      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
+    });
+}
+
+// ------------------------------------------------------------
+// Busca com subdivisão adaptativa (blocos bem pequenos)
+// ------------------------------------------------------------
 async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
   const tagClauses = getTagsForTermo(termo);
   const seen = new Map();
 
-  // Tenta primeiro a estratégia principal (tag ou nome)
   if (tagClauses && !tryNameOnly) {
     try {
       const tagResults = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
       tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-      // Se a busca por tag retornou muitos resultados, talvez não precise buscar nome
-      if (seen.size < 200) {
+      if (seen.size < 100) {
         // Busca por nome complementar
         try {
           const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
           nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-        } catch (nameErr) {
-          // Ignora erro na busca por nome
-        }
+        } catch (nameErr) { /* ignora */ }
       }
     } catch (err) {
       if (err.name === 'AbortError') throw err;
-      console.warn('Busca por tag falhou, tentando apenas nome:', err.message);
+      console.warn('Busca por tag falhou, tentando nome:', err.message);
       try {
         const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
         nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
@@ -287,7 +329,6 @@ async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
       }
     }
   } else {
-    // Busca apenas por nome
     try {
       const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
       nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
@@ -300,15 +341,13 @@ async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
   return Array.from(seen.values());
 }
 
-// Divide o bloco recursivamente até um tamanho mínimo (0.1 grau)
-function splitBboxRecursively(bbox, maxSpan, minSpan = 0.1) {
+function splitBboxRecursively(bbox, maxSpan, minSpan = 0.05) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
   if (latSpan <= maxSpan && lonSpan <= maxSpan) return [bbox];
-  if (latSpan <= minSpan && lonSpan <= minSpan) return [bbox]; // não subdivide mais
+  if (latSpan <= minSpan && lonSpan <= minSpan) return [bbox];
 
-  // Subdivide em 4
   const midLat = (s + n) / 2;
   const midLon = (w + e) / 2;
   return [
@@ -319,12 +358,10 @@ function splitBboxRecursively(bbox, maxSpan, minSpan = 0.1) {
   ].flatMap(sub => splitBboxRecursively(sub, maxSpan, minSpan));
 }
 
-// Busca principal com subdivisão adaptativa
 async function searchElements(termo, bbox, signal, onTileProgress) {
   const hasTags = !!getTagsForTermo(termo);
-  // Tamanho do bloco: menor para nichos sem tags (busca textual pesada)
-  const initialSpan = hasTags ? 0.6 : 0.3;
-  let tiles = splitBboxRecursively(bbox, initialSpan, 0.1);
+  const initialSpan = hasTags ? 0.3 : 0.15; // blocos bem pequenos
+  let tiles = splitBboxRecursively(bbox, initialSpan, 0.05);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
@@ -337,7 +374,6 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
     let elements = [];
     let success = false;
 
-    // Tenta o bloco atual, com fallback para subdivisão se falhar
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         elements = await searchElementsInTile(termo, tiles[i], signal);
@@ -345,16 +381,13 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
         break;
       } catch (err) {
         if (err.name === 'AbortError') throw err;
-        console.warn(`Falha no bloco ${i+1} (tentativa ${attempt+1}):`, err.message);
+        console.warn(`Bloco ${i+1} falhou (tentativa ${attempt+1}):`, err.message);
         if (attempt === 0) {
-          // Subdivide o bloco em 4 menores (recursivamente) e os insere na fila
-          const subTiles = splitBboxRecursively(tiles[i], 0.2, 0.05);
+          // Subdivide ainda mais
+          const subTiles = splitBboxRecursively(tiles[i], 0.1, 0.025);
           tiles.splice(i + 1, 0, ...subTiles);
-          // Processa o primeiro sub-bloco agora
           tiles[i] = subTiles[0];
-          // Os outros serão processados na sequência
         } else {
-          // Falhou também na subdivisão, pula
           success = false;
         }
       }
@@ -362,19 +395,17 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
 
     if (success) {
       elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-    } else {
-      console.warn(`Bloco ${i + 1}/${tiles.length} ignorado após tentativas.`);
     }
 
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
-    if (tiles.length > 1) await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 300));
   }
 
   return Array.from(seen.values());
 }
 
 // ------------------------------------------------------------
-// Parse de elementos do Overpass para lead
+// Parse e UI (mantidos iguais)
 // ------------------------------------------------------------
 function parseElement(el, termo) {
   const tags = el.tags || {};
@@ -382,12 +413,12 @@ function parseElement(el, termo) {
   if (!nome) return null;
 
   const website = tags.website || tags['contact:website'] || tags.url;
-  if (website) return null; // já tem site -> não é lead
+  if (website) return null;
 
   const phone = tags.phone || tags['contact:phone'] || tags['phone:mobile'];
   const whatsappRaw = tags['contact:whatsapp'] || tags.whatsapp;
   const email = tags.email || tags['contact:email'];
-  if (!phone && !whatsappRaw && !email) return null; // sem nenhum contato
+  if (!phone && !whatsappRaw && !email) return null;
 
   const lat = el.lat ?? (el.center ? el.center.lat : null);
   const lon = el.lon ?? (el.center ? el.center.lon : null);
@@ -411,9 +442,6 @@ function parseElement(el, termo) {
   };
 }
 
-// ------------------------------------------------------------
-// UI de scan e progresso
-// ------------------------------------------------------------
 function setScanUI(active, text) {
   $('#scanBox').classList.toggle('active', active);
   if (text) $('#scanText').textContent = text;
@@ -426,7 +454,7 @@ function setProgress(pct) {
 }
 
 // ------------------------------------------------------------
-// Busca principal (performSearch)
+// Perform Search
 // ------------------------------------------------------------
 async function performSearch(e) {
   e.preventDefault();
@@ -472,7 +500,6 @@ async function performSearch(e) {
       await logSearch(termo, localizacao, 'local', totalBrutos, currentResults.length, 0);
       setProgress(100);
     } else {
-      // Modo Brasil inteiro
       for (let i = 0; i < BRAZIL_STATES.length; i++) {
         if (searchAbort.signal.aborted) break;
         const st = BRAZIL_STATES[i];
@@ -493,7 +520,7 @@ async function performSearch(e) {
             const lead = parseElement(el, termo);
             if (lead) { lead.estado = lead.estado || st.uf; currentResults.push(lead); }
           });
-          renderResults(currentResults); // atualiza a tabela progressivamente
+          renderResults(currentResults);
         } catch (stErr) {
           console.warn(`Falha ao buscar em ${st.nome}:`, stErr.message);
         }
@@ -546,7 +573,7 @@ async function logSearch(termo, localizacao, modo, totalEncontrados, totalSemSit
 }
 
 // ------------------------------------------------------------
-// Renderização dos resultados da busca
+// Renderização e salvamento (mantidos)
 // ------------------------------------------------------------
 function renderResults(results) {
   const tbody = $('#resultsBody');
@@ -584,9 +611,6 @@ function renderResults(results) {
   });
 }
 
-// ------------------------------------------------------------
-// Salvar leads no Supabase
-// ------------------------------------------------------------
 async function saveSingleLead(idx) {
   const lead = currentResults[idx];
   if (!lead || !currentUser) return;
@@ -626,7 +650,7 @@ async function saveAllLeads() {
 }
 
 // ------------------------------------------------------------
-// Meus Leads
+// Meus Leads e Logs (mantidos)
 // ------------------------------------------------------------
 async function loadMeusLeads() {
   if (!currentUser) return;
@@ -686,9 +710,6 @@ async function updateLeadStatus(id, status) {
   }
 }
 
-// ------------------------------------------------------------
-// Logs de busca
-// ------------------------------------------------------------
 async function loadLogs() {
   if (!currentUser) return;
   const tbody = $('#logsBody');
@@ -730,7 +751,6 @@ async function loadLogs() {
 // Inicialização
 // ------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
-  // Autocomplete de tipos de negócio
   const datalist = $('#termoSuggestions');
   datalist.innerHTML = Object.keys(TAG_MAP).map(k => `<option value="${escapeHtml(k)}">`).join('');
 
