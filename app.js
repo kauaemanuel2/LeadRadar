@@ -262,7 +262,11 @@ async function fetchOverpass(query, signal) {
     try {
       const res = await fetchWithTimeout(
         mirror,
-        { method: 'POST', body: 'data=' + encodeURIComponent(query) },
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: 'data=' + encodeURIComponent(query)
+        },
         OVERPASS_ATTEMPT_TIMEOUT_MS,
         signal
       );
@@ -341,9 +345,12 @@ function splitBboxIntoTiles(bbox, maxSpanDeg = 1.2, maxTiles = 48) {
 
 // Busca em toda a região, dividindo em blocos automaticamente quando necessário.
 // onTileProgress(concluidos, total) é chamado a cada bloco processado.
+// Retorna também quantos blocos falharam, para diferenciar "sem resultado"
+// de "os servidores do Overpass falharam" no final.
 async function searchElements(termo, bbox, signal, onTileProgress) {
   const tiles = splitBboxIntoTiles(bbox);
   const seen = new Map();
+  let failedTiles = 0;
 
   for (let i = 0; i < tiles.length; i++) {
     if (signal && signal.aborted) { const e = new Error('Busca cancelada'); e.name = 'AbortError'; throw e; }
@@ -352,13 +359,16 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
       elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
     } catch (err) {
       if (err.name === 'AbortError') throw err;
+      failedTiles++;
       console.warn(`Falha no bloco ${i + 1}/${tiles.length}, seguindo para o próximo:`, err.message);
     }
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
-    if (tiles.length > 1) await new Promise(r => setTimeout(r, 500));
+    // intervalo entre requisições, para reduzir a chance de sermos
+    // bloqueados por uso excessivo nos servidores públicos do Overpass
+    if (tiles.length > 1) await new Promise(r => setTimeout(r, 900));
   }
 
-  return Array.from(seen.values());
+  return { elements: Array.from(seen.values()), failedTiles, totalTiles: tiles.length };
 }
 
 function parseElement(el, termo) {
@@ -419,6 +429,8 @@ async function performSearch(e) {
 
   const seenIds = new Set();
   let totalBrutos = 0;
+  let tilesFalhados = 0;
+  let tilesTotais = 0;
 
   try {
     if (searchMode === 'local') {
@@ -431,13 +443,15 @@ async function performSearch(e) {
 
       setScanUI(true, `Vasculhando estabelecimentos em ${localizacao}...`);
       setProgress(30);
-      const elements = await searchElements(termo, bbox, searchAbort.signal, (done, total) => {
+      const { elements, failedTiles, totalTiles } = await searchElements(termo, bbox, searchAbort.signal, (done, total) => {
         if (total > 1) {
           setScanUI(true, `Vasculhando ${localizacao} — bloco ${done}/${total}...`);
           setProgress(30 + Math.round((done / total) * 60));
         }
       });
       totalBrutos += elements.length;
+      tilesFalhados += failedTiles;
+      tilesTotais += totalTiles;
 
       setProgress(85);
       elements.forEach(el => {
@@ -459,12 +473,14 @@ async function performSearch(e) {
         setProgress(Math.round(((i + 1) / BRAZIL_STATES.length) * 100));
 
         try {
-          const elements = await searchElements(termo, st.bbox, searchAbort.signal, (done, total) => {
+          const { elements, failedTiles, totalTiles } = await searchElements(termo, st.bbox, searchAbort.signal, (done, total) => {
             if (total > 1) {
               setScanUI(true, `Vasculhando ${st.nome} — bloco ${done}/${total} (estado ${i + 1}/${BRAZIL_STATES.length})...`);
             }
           });
           totalBrutos += elements.length;
+          tilesFalhados += failedTiles;
+          tilesTotais += totalTiles;
           elements.forEach(el => {
             const key = `${el.type}/${el.id}`;
             if (seenIds.has(key)) return;
@@ -483,8 +499,20 @@ async function performSearch(e) {
     }
 
     renderResults(currentResults);
-    if (currentResults.length === 0) {
-      toast('Nenhum estabelecimento sem site foi encontrado com esses critérios.', '');
+    const tudoFalhou = tilesTotais > 0 && tilesFalhados === tilesTotais;
+    const algumaFalha = tilesFalhados > 0 && !tudoFalhou;
+
+    if (tudoFalhou) {
+      toast('Não foi possível buscar agora: os servidores públicos do OpenStreetMap recusaram ou não responderam. Tente novamente em alguns minutos.', 'error');
+    } else if (currentResults.length === 0) {
+      toast(
+        algumaFalha
+          ? 'Nenhum lead encontrado — e alguns blocos da busca falharam, então pode haver resultados que não foram verificados. Tente novamente.'
+          : 'Nenhum estabelecimento sem site foi encontrado com esses critérios.',
+        ''
+      );
+    } else if (algumaFalha) {
+      toast(`${currentResults.length} leads encontrados (alguns blocos da região falharam e podem ter ficado de fora — pode rodar a busca de novo para tentar completar).`, 'success');
     } else {
       toast(`${currentResults.length} leads encontrados.`, 'success');
     }
