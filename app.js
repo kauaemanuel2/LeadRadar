@@ -1,5 +1,5 @@
 // ============================================================
-// LEAD RADAR — app.js (com blocos otimizados e API própria)
+// LEAD RADAR — app.js (versão definitiva com API + fallback)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -149,7 +149,7 @@ function switchView(name) {
 }
 
 // ------------------------------------------------------------
-// Busca — OpenStreetMap (apenas tags, sem busca por nome)
+// Busca — OpenStreetMap (apenas tags)
 // ------------------------------------------------------------
 function buildWhatsappLink(raw) {
   if (!raw) return null;
@@ -165,14 +165,14 @@ function getTagsForTermo(termo) {
   return TAG_MAP[key] || null;
 }
 
-function buildTagQuery(tagClauses, bbox, limit = 200) {
+function buildTagQuery(tagClauses, bbox, limit = 100) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const clauses = tagClauses.map(tc => {
     const [k, v] = tc.split('=');
     return `nwr["${k}"="${v}"](${bboxStr});`;
   });
-  return `[out:json][timeout:30];(${clauses.join('')});out ${limit} center tags;`;
+  return `[out:json][timeout:20];(${clauses.join('')});out ${limit} center tags;`;
 }
 
 function normalizeText(s) {
@@ -211,9 +211,10 @@ async function geocodeLocation(input) {
 }
 
 // ------------------------------------------------------------
-// Chamada à API própria (Vercel)
+// Chamada à API própria (Vercel) com fallback para proxy CORS
 // ------------------------------------------------------------
 async function fetchOverpass(query, signal) {
+  // Primeira tentativa: API própria
   try {
     const response = await fetch('/api/overpass', {
       method: 'POST',
@@ -223,24 +224,51 @@ async function fetchOverpass(query, signal) {
     });
     if (!response.ok) {
       const errData = await response.json().catch(() => ({}));
-      throw new Error(errData.error || `Erro ${response.status}`);
+      throw new Error(errData.error || `Erro ${response.status} na API`);
     }
     const data = await response.json();
     return data.elements || [];
   } catch (err) {
     if (err.name === 'AbortError') throw err;
-    console.error('Erro na API Overpass:', err);
-    throw new Error('Falha ao consultar o Overpass via API. Tente novamente.');
+    console.warn('API própria falhou, tentando proxy CORS:', err.message);
+    // Fallback: proxy CORS (corsproxy.io)
+    try {
+      const proxy = 'https://corsproxy.io/?';
+      const mirror = 'https://overpass-api.de/api/interpreter';
+      const url = proxy + encodeURIComponent(mirror + '?data=' + encodeURIComponent(query));
+      const res = await fetchWithTimeout(url, {}, 20000, signal);
+      if (!res.ok) throw new Error(`Proxy respondeu ${res.status}`);
+      const data = await res.json();
+      return data.elements || [];
+    } catch (fallbackErr) {
+      if (fallbackErr.name === 'AbortError') throw fallbackErr;
+      console.error('Fallback CORS também falhou:', fallbackErr.message);
+      throw new Error('Todas as tentativas de consulta ao Overpass falharam. Tente novamente.');
+    }
   }
 }
 
+function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
+  const controller = new AbortController();
+  const onOuterAbort = () => controller.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort();
+    outerSignal.addEventListener('abort', onOuterAbort);
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => {
+      clearTimeout(timer);
+      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
+    });
+}
+
 // ------------------------------------------------------------
-// Busca com subdivisão adaptativa (blocos muito pequenos)
+// Busca com subdivisão em blocos minúsculos
 // ------------------------------------------------------------
 async function searchElementsInTile(termo, bbox, signal) {
   const tagClauses = getTagsForTermo(termo);
-  if (!tagClauses) return []; // sem tags, não busca
-
+  if (!tagClauses) return [];
   try {
     const results = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
     return results;
@@ -251,7 +279,7 @@ async function searchElementsInTile(termo, bbox, signal) {
   }
 }
 
-function splitBboxRecursively(bbox, maxSpan, minSpan = 0.02) {
+function splitBboxRecursively(bbox, maxSpan, minSpan = 0.01) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
@@ -269,9 +297,9 @@ function splitBboxRecursively(bbox, maxSpan, minSpan = 0.02) {
 }
 
 async function searchElements(termo, bbox, signal, onTileProgress) {
-  // Blocos muito pequenos (0.15° com tags, 0.08° sem tags - mas sem tags não busca)
-  const initialSpan = 0.15;
-  let tiles = splitBboxRecursively(bbox, initialSpan, 0.02);
+  // Blocos extremamente pequenos: 0.05 graus
+  const initialSpan = 0.05;
+  let tiles = splitBboxRecursively(bbox, initialSpan, 0.01);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
@@ -282,32 +310,27 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
     }
 
     let elements = [];
-    let success = false;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        elements = await searchElementsInTile(termo, tiles[i], signal);
-        success = true;
-        break;
-      } catch (err) {
-        if (err.name === 'AbortError') throw err;
-        console.warn(`Bloco ${i+1} falhou (tentativa ${attempt+1}):`, err.message);
-        if (attempt === 0) {
-          const subTiles = splitBboxRecursively(tiles[i], 0.05, 0.01);
-          tiles.splice(i + 1, 0, ...subTiles);
-          tiles[i] = subTiles[0];
-        } else {
-          success = false;
+    try {
+      elements = await searchElementsInTile(termo, tiles[i], signal);
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      console.warn(`Bloco ${i+1} falhou:`, err.message);
+      // Tenta subdividir ainda mais
+      const subTiles = splitBboxRecursively(tiles[i], 0.02, 0.005);
+      for (const sub of subTiles) {
+        try {
+          const subElements = await searchElementsInTile(termo, sub, signal);
+          elements = elements.concat(subElements);
+        } catch (subErr) {
+          if (subErr.name === 'AbortError') throw subErr;
+          console.warn('Subbloco falhou:', subErr.message);
         }
       }
     }
 
-    if (success) {
-      elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-    }
-
+    elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 100));
   }
 
   return Array.from(seen.values());
@@ -367,7 +390,6 @@ async function performSearch(e) {
   const termo = $('#termoInput').value.trim();
   if (!termo) { toast('Digite o tipo de negócio.', 'error'); return; }
 
-  // Verifica se o termo tem mapeamento de tags
   if (!getTagsForTermo(termo)) {
     toast('Nenhum mapeamento de tags para este termo. Adicione em TAG_MAP.', 'error');
     return;

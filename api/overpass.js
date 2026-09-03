@@ -9,24 +9,30 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Query inválida' });
   }
 
-  // Apenas o mirror mais rápido (overpass-api.de)
   const mirror = 'https://overpass-api.de/api/interpreter';
-  const TIMEOUT = 58000; // 58 segundos (Vercel Hobby = 60s)
+  const TIMEOUT = 58000; // 58 segundos (limite da Vercel Hobby: 60s)
 
   try {
-    const url = mirror + '?data=' + encodeURIComponent(query);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' },
+    // Overpass aceita POST com body: data=QUERY (form-urlencoded)
+    const response = await fetch(mirror, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+      },
+      body: `data=${encodeURIComponent(query)}`,
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      throw new Error(`Overpass respondeu ${response.status}`);
+      const text = await response.text();
+      return res.status(response.status).json({
+        error: `Overpass respondeu ${response.status}: ${text.substring(0, 100)}`,
+      });
     }
 
     const data = await response.json();
