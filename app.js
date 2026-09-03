@@ -1,14 +1,14 @@
 // ============================================================
-// LEAD RADAR — app.js (corrigido: timeout, blocos, proxy)
+// LEAD RADAR — app.js (corrigido: adaptação dinâmica de blocos)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let currentUser = null;
-let currentResults = [];   // resultados da última busca (não salvos ainda)
-let savedOsmIds = new Set(); // ids já salvos nesta sessão (feedback visual)
+let currentResults = [];
+let savedOsmIds = new Set();
 let searchAbort = null;
-let searchMode = 'local';  // 'local' | 'brasil'
+let searchMode = 'local';
 
 // ------------------------------------------------------------
 // Helpers de UI
@@ -47,7 +47,7 @@ function clearAuthMsg() {
   box.className = 'auth-msg';
 }
 
-let authMode = 'login'; // 'login' | 'signup'
+let authMode = 'login';
 
 function setAuthMode(mode) {
   authMode = mode;
@@ -139,9 +139,6 @@ function renderAuthState() {
   }
 }
 
-// ------------------------------------------------------------
-// Navegação entre views
-// ------------------------------------------------------------
 function switchView(name) {
   $all('.view').forEach(v => v.classList.remove('active'));
   $all('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -152,7 +149,7 @@ function switchView(name) {
 }
 
 // ------------------------------------------------------------
-// Busca — OpenStreetMap (Nominatim + Overpass)
+// Busca — OpenStreetMap
 // ------------------------------------------------------------
 function buildWhatsappLink(raw) {
   if (!raw) return null;
@@ -175,14 +172,14 @@ function buildTagQuery(tagClauses, bbox) {
     const [k, v] = tc.split('=');
     return `nwr["${k}"="${v}"](${bboxStr});`;
   });
-  return `[out:json][timeout:30];(${clauses.join('')});out center tags;`;
+  return `[out:json][timeout:45];(${clauses.join('')});out center tags;`;
 }
 
 function buildNameQuery(termo, bbox) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const safeTerm = termo.trim().replace(/["\\]/g, '');
-  return `[out:json][timeout:30];(nwr["name"~"${safeTerm}",i](${bboxStr}););out center tags;`;
+  return `[out:json][timeout:45];(nwr["name"~"${safeTerm}",i](${bboxStr}););out center tags;`;
 }
 
 function normalizeText(s) {
@@ -198,7 +195,6 @@ const UF_TO_NOME = Object.fromEntries(BRAZIL_STATES.map(st => [st.uf, st.nome]))
 
 async function geocodeLocation(input) {
   const raw = input.trim();
-
   const stateMatch = findBrazilState(raw);
   if (stateMatch) return stateMatch.bbox;
 
@@ -222,7 +218,7 @@ async function geocodeLocation(input) {
 }
 
 // ------------------------------------------------------------
-// Proxy CORS + Overpass — com fallback e timeout maior
+// Proxy CORS + Overpass — com retry e backoff
 // ------------------------------------------------------------
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
@@ -230,62 +226,56 @@ const OVERPASS_MIRRORS = [
   'https://overpass.openstreetmap.ru/api/interpreter',
 ];
 
-// Proxies públicos (ordem de preferência)
 const CORS_PROXIES = [
   'https://api.allorigins.win/raw?url=',
   'https://corsproxy.io/?',
 ];
 
-// Timeout por tentativa (30 segundos)
-const REQUEST_TIMEOUT_MS = 30000;
+const REQUEST_TIMEOUT_MS = 45000;
 
-async function fetchOverpass(query, signal) {
+async function fetchOverpass(query, signal, retries = 2) {
   let lastErr = null;
-
-  // Itera sobre os proxies
-  for (const proxy of CORS_PROXIES) {
-    // Para cada proxy, tenta todos os espelhos do Overpass
-    for (const mirror of OVERPASS_MIRRORS) {
-      try {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    for (const proxy of CORS_PROXIES) {
+      for (const mirror of OVERPASS_MIRRORS) {
+        try {
+          const fullUrl = mirror + '?data=' + encodeURIComponent(query);
+          const proxyUrl = proxy + encodeURIComponent(fullUrl);
+          const res = await fetchWithTimeout(proxyUrl, {}, REQUEST_TIMEOUT_MS, signal);
+          if (res.status === 504 || res.status === 429 || res.status >= 500) {
+            lastErr = new Error(`${mirror.replace('https://', '').split('/')[0]} respondeu ${res.status}`);
+            continue;
+          }
+          if (!res.ok) throw new Error(`Overpass respondeu ${res.status}`);
+          const data = await res.json();
+          return data.elements || [];
+        } catch (err) {
+          if (signal && signal.aborted) {
+            const e = new Error('Busca cancelada');
+            e.name = 'AbortError';
+            throw e;
+          }
+          lastErr = err;
+          console.warn(`Tentativa ${attempt + 1} com ${mirror} via ${proxy} falhou:`, err.message);
+          // Aguarda antes de tentar o próximo proxy/espelho (backoff)
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        }
+      }
+    }
+    // Se chegou aqui, tenta diretamente (sem proxy) como último recurso
+    try {
+      for (const mirror of OVERPASS_MIRRORS) {
         const fullUrl = mirror + '?data=' + encodeURIComponent(query);
-        const proxyUrl = proxy + encodeURIComponent(fullUrl);
-
-        const res = await fetchWithTimeout(proxyUrl, {}, REQUEST_TIMEOUT_MS, signal);
-        if (res.status === 504 || res.status === 429 || res.status >= 500) {
-          lastErr = new Error(`${mirror.replace('https://', '').split('/')[0]} respondeu ${res.status}`);
-          continue;
+        const res = await fetchWithTimeout(fullUrl, {}, REQUEST_TIMEOUT_MS, signal);
+        if (res.ok) {
+          const data = await res.json();
+          return data.elements || [];
         }
-        if (!res.ok) throw new Error(`Overpass respondeu ${res.status}`);
-        const data = await res.json();
-        return data.elements || [];
-      } catch (err) {
-        if (signal && signal.aborted) {
-          const e = new Error('Busca cancelada');
-          e.name = 'AbortError';
-          throw e;
-        }
-        lastErr = err;
-        console.warn(`Tentativa com ${mirror} via ${proxy} falhou:`, err.message);
-        continue;
       }
+    } catch (err) {
+      lastErr = err;
     }
-    // Se chegou aqui, todos os espelhos falharam para este proxy, tenta o próximo proxy
   }
-
-  // Último recurso: tentar diretamente (sem proxy) — pode funcionar se o CORS estiver liberado
-  try {
-    for (const mirror of OVERPASS_MIRRORS) {
-      const fullUrl = mirror + '?data=' + encodeURIComponent(query);
-      const res = await fetchWithTimeout(fullUrl, {}, REQUEST_TIMEOUT_MS, signal);
-      if (res.ok) {
-        const data = await res.json();
-        return data.elements || [];
-      }
-    }
-  } catch (err) {
-    lastErr = err;
-  }
-
   throw lastErr || new Error('Todos os servidores e proxies falharam. Tente novamente mais tarde.');
 }
 
@@ -304,32 +294,45 @@ function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
     });
 }
 
-// Busca combinando tag + nome, dentro de UM bloco
-async function searchElementsInTile(termo, bbox, signal) {
+// ------------------------------------------------------------
+// Busca com adaptação dinâmica de blocos
+// ------------------------------------------------------------
+async function searchElementsInTile(termo, bbox, signal, tryNameOnly = false) {
   const tagClauses = getTagsForTermo(termo);
   const seen = new Map();
 
-  if (tagClauses) {
-    const tagResults = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
-    tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-  }
-
-  if (!tagClauses || seen.size < 5) {
-    await new Promise(r => setTimeout(r, 300));
+  if (tagClauses && !tryNameOnly) {
+    try {
+      const tagResults = await fetchOverpass(buildTagQuery(tagClauses, bbox), signal);
+      tagResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      console.warn('Busca por tag falhou, tentando apenas nome:', err.message);
+      // Se a busca por tag falhou, tentamos apenas por nome
+      try {
+        const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
+        nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
+      } catch (nameErr) {
+        if (nameErr.name === 'AbortError') throw nameErr;
+        console.warn('Busca por nome também falhou:', nameErr.message);
+      }
+    }
+  } else {
+    // Busca apenas por nome
     try {
       const nameResults = await fetchOverpass(buildNameQuery(termo, bbox), signal);
       nameResults.forEach(el => seen.set(`${el.type}/${el.id}`, el));
     } catch (err) {
       if (err.name === 'AbortError') throw err;
-      console.warn('Busca por nome falhou nesse bloco, seguindo só com resultados por tag:', err.message);
+      console.warn('Busca por nome falhou:', err.message);
     }
   }
 
   return Array.from(seen.values());
 }
 
-// Divide a região em blocos menores (maxSpanDeg = 1.0 para consultas mais rápidas)
-function splitBboxIntoTiles(bbox, maxSpanDeg = 1.0, maxTiles = 30) {
+// Divide a região em blocos, com tamanho adaptativo
+function splitBboxIntoTiles(bbox, maxSpanDeg) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
@@ -340,7 +343,7 @@ function splitBboxIntoTiles(bbox, maxSpanDeg = 1.0, maxTiles = 30) {
   for (let attempt = 0; attempt < 6; attempt++) {
     const rows = Math.max(1, Math.ceil(latSpan / span));
     const cols = Math.max(1, Math.ceil(lonSpan / span));
-    if (rows * cols <= maxTiles) {
+    if (rows * cols <= 30) {
       const dLat = latSpan / rows;
       const dLon = lonSpan / cols;
       tiles = [];
@@ -356,8 +359,12 @@ function splitBboxIntoTiles(bbox, maxSpanDeg = 1.0, maxTiles = 30) {
   return [bbox];
 }
 
+// Busca principal com adaptação: se um bloco falha, subdivide-o em 4 menores e tenta novamente
 async function searchElements(termo, bbox, signal, onTileProgress) {
-  const tiles = splitBboxIntoTiles(bbox);
+  const hasTags = !!getTagsForTermo(termo);
+  // Blocos menores para termos sem tags (busca textual)
+  const initialSpan = hasTags ? 1.0 : 0.6;
+  let tiles = splitBboxIntoTiles(bbox, initialSpan);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
@@ -366,13 +373,50 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
       e.name = 'AbortError';
       throw e;
     }
-    try {
-      const elements = await searchElementsInTile(termo, tiles[i], signal);
-      elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
-    } catch (err) {
-      if (err.name === 'AbortError') throw err;
-      console.warn(`Falha no bloco ${i + 1}/${tiles.length}, seguindo para o próximo:`, err.message);
+
+    let elements = [];
+    let currentTile = tiles[i];
+    let success = false;
+
+    // Tenta o bloco atual, se falhar, subdivide em 4
+    for (let subAttempt = 0; subAttempt < 2; subAttempt++) {
+      try {
+        elements = await searchElementsInTile(termo, currentTile, signal);
+        success = true;
+        break;
+      } catch (err) {
+        if (err.name === 'AbortError') throw err;
+        console.warn(`Falha no bloco (${subAttempt + 1}):`, err.message);
+        if (subAttempt === 0) {
+          // Subdivide o bloco em 4 menores
+          const [s, w, n, e] = currentTile;
+          const midLat = (s + n) / 2;
+          const midLon = (w + e) / 2;
+          const subTiles = [
+            [s, w, midLat, midLon],
+            [s, midLon, midLat, e],
+            [midLat, w, n, midLon],
+            [midLat, midLon, n, e]
+          ];
+          // Substitui os próximos blocos pelos sub-blocos
+          tiles.splice(i + 1, 0, ...subTiles);
+          // Pega o primeiro sub-bloco para tentar agora
+          currentTile = subTiles[0];
+          // Os outros serão processados na sequência
+          // (não incrementa i para processar este sub-bloco)
+        } else {
+          // Se a subdivisão também falhar, pula para o próximo bloco
+          success = false;
+        }
+      }
     }
+
+    if (success) {
+      elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
+    } else {
+      console.warn(`Bloco ${i + 1}/${tiles.length} ignorado após tentativas.`);
+    }
+
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
     if (tiles.length > 1) await new Promise(r => setTimeout(r, 500));
   }
@@ -380,6 +424,9 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
   return Array.from(seen.values());
 }
 
+// ------------------------------------------------------------
+// Parse e UI
+// ------------------------------------------------------------
 function parseElement(el, termo) {
   const tags = el.tags || {};
   const nome = tags.name;
@@ -540,7 +587,7 @@ async function logSearch(termo, localizacao, modo, totalEncontrados, totalSemSit
 }
 
 // ------------------------------------------------------------
-// Renderização dos resultados da busca
+// Renderização dos resultados
 // ------------------------------------------------------------
 function renderResults(results) {
   const tbody = $('#resultsBody');
@@ -579,7 +626,7 @@ function renderResults(results) {
 }
 
 // ------------------------------------------------------------
-// Salvar leads no Supabase
+// Salvar leads
 // ------------------------------------------------------------
 async function saveSingleLead(idx) {
   const lead = currentResults[idx];
@@ -681,7 +728,7 @@ async function updateLeadStatus(id, status) {
 }
 
 // ------------------------------------------------------------
-// Logs de busca
+// Logs
 // ------------------------------------------------------------
 async function loadLogs() {
   if (!currentUser) return;
