@@ -1,29 +1,39 @@
 // api/overpass.js
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Método não permitido' });
+  // Aceita GET e POST (GET é mais simples)
+  if (req.method === 'GET') {
+    const { query } = req.query;
+    if (!query) {
+      return res.status(400).json({ error: 'Query parameter "data" is required' });
+    }
+    return await proxyRequest(query, res);
+  } else if (req.method === 'POST') {
+    const { query } = req.body;
+    if (!query) {
+      return res.status(400).json({ error: 'Query body is required' });
+    }
+    return await proxyRequest(query, res);
+  } else {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
+}
 
-  const { query } = req.body;
-  if (!query || typeof query !== 'string') {
-    return res.status(400).json({ error: 'Query inválida' });
-  }
-
+async function proxyRequest(query, res) {
   const mirror = 'https://overpass-api.de/api/interpreter';
-  const TIMEOUT = 58000; // 58 segundos (limite da Vercel Hobby: 60s)
+  const TIMEOUT = 30000; // 30 segundos
 
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
 
-    // Overpass aceita POST com body: data=QUERY (form-urlencoded)
-    const response = await fetch(mirror, {
-      method: 'POST',
+    // Usa GET com data na URL
+    const url = mirror + '?data=' + encodeURIComponent(query);
+    const response = await fetch(url, {
+      method: 'GET',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
+        'User-Agent': 'LeadRadar/1.0 (https://lead-radar.vercel.app)',
       },
-      body: `data=${encodeURIComponent(query)}`,
       signal: controller.signal,
     });
     clearTimeout(timeoutId);

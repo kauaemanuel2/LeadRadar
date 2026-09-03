@@ -1,5 +1,5 @@
 // ============================================================
-// LEAD RADAR — app.js (versão definitiva com API + fallback)
+// LEAD RADAR — app.js (versão final, somente API própria)
 // ============================================================
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -165,14 +165,14 @@ function getTagsForTermo(termo) {
   return TAG_MAP[key] || null;
 }
 
-function buildTagQuery(tagClauses, bbox, limit = 100) {
+function buildTagQuery(tagClauses, bbox, limit = 50) {
   const [s, w, n, e] = bbox;
   const bboxStr = `${s},${w},${n},${e}`;
   const clauses = tagClauses.map(tc => {
     const [k, v] = tc.split('=');
     return `nwr["${k}"="${v}"](${bboxStr});`;
   });
-  return `[out:json][timeout:20];(${clauses.join('')});out ${limit} center tags;`;
+  return `[out:json][timeout:15];(${clauses.join('')});out ${limit} center tags;`;
 }
 
 function normalizeText(s) {
@@ -211,17 +211,12 @@ async function geocodeLocation(input) {
 }
 
 // ------------------------------------------------------------
-// Chamada à API própria (Vercel) com fallback para proxy CORS
+// Chamada à API própria (Vercel) usando GET
 // ------------------------------------------------------------
 async function fetchOverpass(query, signal) {
-  // Primeira tentativa: API própria
   try {
-    const response = await fetch('/api/overpass', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
-      signal,
-    });
+    const url = '/api/overpass?query=' + encodeURIComponent(query);
+    const response = await fetch(url, { signal });
     if (!response.ok) {
       const errData = await response.json().catch(() => ({}));
       throw new Error(errData.error || `Erro ${response.status} na API`);
@@ -230,37 +225,9 @@ async function fetchOverpass(query, signal) {
     return data.elements || [];
   } catch (err) {
     if (err.name === 'AbortError') throw err;
-    console.warn('API própria falhou, tentando proxy CORS:', err.message);
-    // Fallback: proxy CORS (corsproxy.io)
-    try {
-      const proxy = 'https://corsproxy.io/?';
-      const mirror = 'https://overpass-api.de/api/interpreter';
-      const url = proxy + encodeURIComponent(mirror + '?data=' + encodeURIComponent(query));
-      const res = await fetchWithTimeout(url, {}, 20000, signal);
-      if (!res.ok) throw new Error(`Proxy respondeu ${res.status}`);
-      const data = await res.json();
-      return data.elements || [];
-    } catch (fallbackErr) {
-      if (fallbackErr.name === 'AbortError') throw fallbackErr;
-      console.error('Fallback CORS também falhou:', fallbackErr.message);
-      throw new Error('Todas as tentativas de consulta ao Overpass falharam. Tente novamente.');
-    }
+    console.error('Erro na API Overpass:', err);
+    throw new Error('Falha ao consultar o Overpass via API. Tente novamente.');
   }
-}
-
-function fetchWithTimeout(url, options, timeoutMs, outerSignal) {
-  const controller = new AbortController();
-  const onOuterAbort = () => controller.abort();
-  if (outerSignal) {
-    if (outerSignal.aborted) controller.abort();
-    outerSignal.addEventListener('abort', onOuterAbort);
-  }
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => {
-      clearTimeout(timer);
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
-    });
 }
 
 // ------------------------------------------------------------
@@ -279,7 +246,7 @@ async function searchElementsInTile(termo, bbox, signal) {
   }
 }
 
-function splitBboxRecursively(bbox, maxSpan, minSpan = 0.01) {
+function splitBboxRecursively(bbox, maxSpan, minSpan = 0.005) {
   const [s, w, n, e] = bbox;
   const latSpan = n - s;
   const lonSpan = e - w;
@@ -297,9 +264,8 @@ function splitBboxRecursively(bbox, maxSpan, minSpan = 0.01) {
 }
 
 async function searchElements(termo, bbox, signal, onTileProgress) {
-  // Blocos extremamente pequenos: 0.05 graus
-  const initialSpan = 0.05;
-  let tiles = splitBboxRecursively(bbox, initialSpan, 0.01);
+  const initialSpan = 0.03; // blocos muito pequenos
+  let tiles = splitBboxRecursively(bbox, initialSpan, 0.005);
   const seen = new Map();
 
   for (let i = 0; i < tiles.length; i++) {
@@ -315,22 +281,21 @@ async function searchElements(termo, bbox, signal, onTileProgress) {
     } catch (err) {
       if (err.name === 'AbortError') throw err;
       console.warn(`Bloco ${i+1} falhou:`, err.message);
-      // Tenta subdividir ainda mais
-      const subTiles = splitBboxRecursively(tiles[i], 0.02, 0.005);
+      // Tenta subdividir mais
+      const subTiles = splitBboxRecursively(tiles[i], 0.01, 0.002);
       for (const sub of subTiles) {
         try {
           const subElements = await searchElementsInTile(termo, sub, signal);
           elements = elements.concat(subElements);
         } catch (subErr) {
           if (subErr.name === 'AbortError') throw subErr;
-          console.warn('Subbloco falhou:', subErr.message);
         }
       }
     }
 
     elements.forEach(el => seen.set(`${el.type}/${el.id}`, el));
     if (onTileProgress) onTileProgress(i + 1, tiles.length);
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 50));
   }
 
   return Array.from(seen.values());
@@ -458,7 +423,7 @@ async function performSearch(e) {
         } catch (stErr) {
           console.warn(`Falha ao buscar em ${st.nome}:`, stErr.message);
         }
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 800));
       }
       await logSearch(termo, 'Brasil inteiro', 'brasil', totalBrutos, currentResults.length, 0);
     }
